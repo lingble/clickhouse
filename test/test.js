@@ -5,15 +5,21 @@ const expect = require('expect.js');
 const _  = require('lodash');
 const https = require('https');
 const fs = require('fs');
+const path = require('path');
 
 const { ClickHouse } = require('../.');
 
 const database = 'test_' + _.random(1000, 100000);
 
 const
+	configFilepath = process.env.CLICKHOUSE_TEST_CONF_FILE || './test_config.json',
+    configPath = path.resolve(process.cwd(), configFilepath),
+    extConfig = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, { encoding: 'utf-8' })) : undefined,
 	config     = {
-		debug: false,
+		...extConfig,
+		debug: false,		
 	},
+
 	clickhouse = new ClickHouse({
 		...config,
 		database : database,
@@ -34,6 +40,24 @@ before(async () => {
 	await temp.query(`CREATE DATABASE ${database}`).toPromise();
 });
 
+describe.skip('On cluster', () => {
+	// Note: this test only works with ClickHouse setup as Cluster named test_cluster
+	it('should be able to create and drop a table', async () => {
+		const createTableQuery = `
+			CREATE TABLE ${database}.test_on_cluster ON CLUSTER test_cluster (
+				test String
+			)
+			ENGINE=MergeTree ORDER BY test;`;
+	  	const createTableQueryResult = await clickhouse.query(createTableQuery).toPromise();
+	  	expect(createTableQueryResult).to.be.ok();
+
+		const dropTableQuery = `
+			DROP TABLE ${database}.test_on_cluster ON CLUSTER test_cluster;`;
+	  	const dropTableQueryResult = await clickhouse.query(dropTableQuery).toPromise();
+	  	expect(dropTableQueryResult).to.be.ok();
+	});
+});
+  
 describe('Exec', () => {
 	it('should return not null object', async () => {
 		const sqlList = [
@@ -143,6 +167,24 @@ describe('Select', () => {
 				
 				callback();
 			})
+	});
+
+	it('streams should handle network error', function(callback) {
+		let i = 0;
+		const host = 'non-existing-clickhouse-server'; // to simulate a dns failure
+
+		new ClickHouse({
+			...config,
+			host
+		}).query('SELECT number FROM system.numbers LIMIT 10').stream()
+			.on('data', () => ++i)
+			.on('error', error => {
+				expect(error.code).to.be.equal('ENOTFOUND');
+				expect(error.syscall).to.be.equal('getaddrinfo');
+				expect(error.hostname).to.be.equal(host);
+				expect(i).to.be(0);				
+				callback();
+			});
 	});
 	
 	const nodeVersion = process.version.split('.')[0].substr(1);
@@ -305,7 +347,7 @@ describe('Select', () => {
 
 });
 
-describe('session', () => {
+(extConfig? describe.skip : describe)('session', () => {
 	it('use session', async () => {
 		const sessionId = clickhouse.sessionId;
 		clickhouse.sessionId = Date.now();
@@ -407,7 +449,8 @@ describe('session', () => {
 // You can use all settings from request library (https://github.com/request/request#tlsssl-protocol)
 // Generate ssl file with:
 // sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout test/cert/server.key -out test/cert/server.crt
-describe('TLS/SSL Protocol', () => {
+
+(extConfig? describe.skip : describe)('TLS/SSL Protocol', () => {
 	it('use TLS/SSL Protocol', async () => {
 		let server = null;
 
@@ -472,7 +515,8 @@ describe('queries', () => {
 				str String,
 				arr Array(String),
 				arr2 Array(Date),
-				arr3 Array(UInt8)
+				arr3 Array(UInt8),
+				id1 UUID
 			) ENGINE=MergeTree(date, date, 8192)
 		`).toPromise();
 		expect(r).to.be.ok();
@@ -482,24 +526,30 @@ describe('queries', () => {
 				date: '2018-01-01',
 				str: 'Вам, проживающим за оргией оргию,',
 				arr: [],
-				arr2: ['1915-01-02', '1915-01-03'],
-				arr3: [1,2,3,4,5]
+				arr2: ['1985-01-02', '1985-01-03'],
+				arr3: [1,2,3,4,5],
+				id1: '102a05cb-8aaf-4f11-a442-20c3558e4384'
 			},
 			
 			{
 				date: '2018-02-01',
-				str: 'имеющим ванную и теплый клозет!',
-				arr: ['5670000000', 'asdas dasf'],
-				arr2: ['1915-02-02'],
-				arr3: []
+				str: 'It\'s apostrophe test.',
+				arr: ['5670000000', 'asdas dasf. It\'s apostrophe test.'],
+				arr2: ['1985-02-02'],
+				arr3: [],
+				id1: 'c2103985-9a1e-4f4a-b288-b292b5209de1'
 			}
 		];
 		
 		const r2 = await clickhouse.insert(
-			'INSERT INTO test_array (date, str, arr, arr2, arr3)',
+			`insert into test_array 
+			(date, str, arr, arr2, 
+			 arr3, id1)`,
 			rows
 		).toPromise();
 		expect(r2).to.be.ok();
+		const r3 = await clickhouse.query('SELECT * FROM test_array ORDER BY date').toPromise();		
+		expect(r3).to.eql(rows);
 	});
 
 	it('insert field as raw string', async () => {
@@ -519,7 +569,7 @@ describe('queries', () => {
 		
 		const rows = [
 			'(\'2018-01-01 10:00:00\',\'Вам, проживающим за оргией оргию,\',[],[\'1915-01-02 10:00:00\',\'1915-01-03 10:00:00\'],[1,2,3,4,5],unhex(\'60ed56e75bb93bd353267faa\'))',
-			'(\'2018-02-01 10:00:00\',\'имеющим ванную и теплый клозет!\',[\'5670000000\',\'asdas dasf\'],[\'1915-02-02 10:00:00\'],[],unhex(\'60ed56f4a88cd5dcb249d959\'))'
+			'(\'2018-02-01 10:00:00\',\'имеющим ванную и теплый клозет! It\'\'s apostrophe test.\',[\'5670000000\',\'asdas dasf\'],[\'1915-02-02 10:00:00\'],[],unhex(\'60ed56f4a88cd5dcb249d959\'))'
 		];
 		
 		const r2 = await clickhouse.insert(
@@ -657,6 +707,102 @@ describe('queries', () => {
 		const result4 = await clickhouse.query('SELECT int_value FROM test_int_temp').toPromise();
 		expect(result4).to.eql(int_value_data);
 	});
+
+	it('insert with params', async () => {
+		const result = await clickhouse.query('DROP TABLE IF EXISTS test_par_temp').toPromise();
+		expect(result).to.be.ok();
+		
+		const result1 = await clickhouse.query(`CREATE TABLE test_par_temp (
+			int_value UInt32, 
+			str_value1 String, 
+			str_value2 String, 
+			date_value Date, 
+			date_time_value DateTime, 
+			decimal_value Decimal(10,4),
+			arr Array(String),
+			arr2 Array(Date),
+			arr3 Array(UInt32)
+		) ENGINE=Memory`).toPromise();
+		expect(result1).to.be.ok();
+		
+		const row = {
+			int_value: 12345,
+			str_value1: 'Test for "masked" characters. It workes, isn\'t it?',
+			str_value2: JSON.stringify({name:'It is "something".'}),
+			date_value: '2022-08-18',
+			date_time_value: '2022-08-18 19:07:00',
+			decimal_value: 1234.678,
+			arr: ['asdfasdf', 'It\'s apostrophe test'],
+			arr2: ['2022-01-01', '2022-10-10'],
+			arr3: [12345, 54321],
+		};
+		const result2 = await clickhouse.insert(`INSERT INTO test_par_temp (int_value, str_value1, str_value2, date_value, date_time_value,	decimal_value,
+			arr, arr2, arr3)
+			VALUES ({int_value:UInt32}, {str_value1:String}, {str_value2:String}, {date_value:Date}, {date_time_value:DateTime}, {decimal_value: Decimal(10,4)},
+			{arr:Array(String)},{arr2:Array(Date)},{arr3:Array(UInt32)})`, 
+			{params: {
+				...row,
+				decimal_value: row.decimal_value.toFixed(4)
+				}
+			}).toPromise();
+		expect(result2).to.be.ok();
+		
+		const result3 = await clickhouse.query('SELECT * FROM test_par_temp').toPromise();		
+		expect(result3).to.eql([row]);
+	});
+
+	it('insert select', async () => {
+		const result = await clickhouse.query('DROP TABLE IF EXISTS test_par_temp').toPromise();
+		expect(result).to.be.ok();
+		
+		const result1 = await clickhouse.query(`CREATE TABLE test_par_temp (
+			int_value UInt32, 
+			str_value1 String, 
+			str_value2 String, 
+			date_value Date, 
+			date_time_value DateTime, 
+			decimal_value Decimal(10,4),
+			arr Array(String),
+			arr2 Array(Date),
+			arr3 Array(UInt32)
+		) ENGINE=Memory`).toPromise();
+		expect(result1).to.be.ok();
+		
+		const row = {
+			int_value: 12345,
+			str_value1: 'Test for "masked" characters. It workes, isn\'t it?',
+			str_value2: JSON.stringify({name:'It is "something".'}),
+			date_value: '2022-08-18',
+			date_time_value: '2022-08-18 19:07:00',
+			decimal_value: 1234.678,
+			arr: ['asdfasdf', 'It\'s apostrophe test'],
+			arr2: ['2022-01-01', '2022-10-10'],
+			arr3: [12345, 54321],
+		};
+		const result2 = await clickhouse.insert(`INSERT INTO test_par_temp (int_value, str_value1, str_value2, date_value, date_time_value,	decimal_value,
+			arr, arr2, arr3)
+			select {int_value:UInt32}, {str_value1:String}, {str_value2:String}, {date_value:Date}, {date_time_value:DateTime}, {decimal_value: Decimal(10,4)},
+			{arr:Array(String)},{arr2:Array(Date)},{arr3:Array(UInt32)}`, 
+			{params: {
+				...row,
+				decimal_value: row.decimal_value.toFixed(4)
+				}
+			}).toPromise();
+		expect(result2).to.be.ok();
+
+		const result3 = await clickhouse.query('SELECT * FROM test_par_temp').toPromise();		
+		expect(result3).to.eql([row]);
+
+		const result4 = await clickhouse.insert(`INSERT INTO test_par_temp (int_value, str_value1, str_value2, date_value, date_time_value,	decimal_value,
+			arr, arr2, arr3)
+			select 123456, 'awerqwerqwer', 'rweerwrrewr', '2022-08-25', '2022-08-25 02:00:01', '123.1234',
+			['aaa','bbb'],['2022-08-22','2022-08-23'],[1,2,3,4]`
+			).toPromise();
+		expect(result2).to.be.ok();
+		
+
+	});
+	
 });
 
 describe('response codes', () => {
@@ -728,7 +874,7 @@ describe('compatibility with Sequelize ORM', () => {
 
 
 
-describe('Constructor options', () => {
+(extConfig? describe.skip : describe)('Constructor options', () => {
 	const addConfigs = [
 		{
 			url: 'localhost',
@@ -964,6 +1110,15 @@ describe('Select and WITH TOTALS statement', () => {
 		expect(result).to.have.key('rows');
 		expect(result.rows).to.be(LIMIT_COUNT);
 		expect(result).to.have.key('statistics');
+	});
+
+	it('start with WITH', async() => {
+		const r = await clickhouse.query(`
+			WITH x as (SELECT 1) SELECT * FROM x
+		`).toPromise();
+
+		expect(r).to.be.ok();
+		expect(r[0]).to.be.eql({1: 1});
 	});
 });
 

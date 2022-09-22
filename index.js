@@ -10,6 +10,7 @@ const stream2asynciter = require('stream2asynciter');
 const { URL } = require('url');
 const tsv = require('tsv');
 const uuidv4 = require('uuid/v4');
+const INSERT_FIELDS_MASK = /^INSERT\sINTO\s(.+?)\s*\(((\n|.)+?)\)/i;
 
 
 /**
@@ -39,7 +40,7 @@ var ESCAPE_STRING = {
 	TSV: function (value) {
 		return value
 			.replace(/\\/g, '\\\\')
-			.replace(/\\/g, '\\')
+			.replace(/\'/g, '\\\'')
 			.replace(/\t/g, '\\t')
 			.replace(/\n/g, '\\n');
 	},
@@ -302,12 +303,16 @@ class Rs extends Transform {
 			return Promise.resolve();
 		} else {
 			return new Promise((resolve, reject) => {
-				this.ws.once('error', err => reject(err));
+				const fn = err => reject(err);
+				this.ws.once('error', fn);
 				this.ws.once('drain', err => {
-					if (err) return reject(err);
-					
-					resolve();
-				})
+					this.ws.removeListener('error', fn);
+					if (err) {
+						reject(err);
+					} else {
+						resolve();
+					}
+				});
 			});
 		}
 	}
@@ -416,7 +421,7 @@ class QueryCursor {
 		}
 		
 		if (isFirstElObject) {
-			let m = query.match(/INSERT INTO (.+?) \((.+?)\)/);
+			let m = query.match(INSERT_FIELDS_MASK);
 			if (m) {
 				fieldList = m[2].split(',').map(s => s.trim());
 			} else {
@@ -492,11 +497,7 @@ class QueryCursor {
 			//   when passed in the request.
 			Object.keys(data.params).forEach(k => {
 
-				let value = data.params[k].toString();
-
-				if (Array.isArray(data.params[k])) {
-					value = '[' + value + ']'
-				};
+				let value = encodeValue(false, data.params[k], 'TabSeparated');
 
 				url.searchParams.append(
 					`param_${k}`, value
@@ -511,9 +512,14 @@ class QueryCursor {
 			}
 			
 			// Hack for Sequelize ORM
-			query = query.trim().trimEnd().replace(/;$/gm, "");
+			query = query.trim().trimEnd().replace(/;$/gm, '');
+			if (me.connection.trimQuery) {
+				// Remove comments from the SQL
+				// replace multiple white spaces with one white space
+				query = query.replace(/(--[^\n]*)/g, '').replace(/\s+/g, ' ')
+			}
 			
-			if (query.match(/^(select|show|exists)/i)) {
+			if (query.match(/^(with|select|show|exists|create|drop)/i)) {
 				if ( ! R_FORMAT_PARSER.test(query)) {
 					query += ` FORMAT ${ClickHouse.getFullFormatName(me.format)}`;
 				}
@@ -543,7 +549,7 @@ class QueryCursor {
 				}
 			} else if (me.isInsert) {
 				if (query.match(/values/i)) {
-					if (data && data.every(d => typeof d === 'string')) {
+					if (data && Array.isArray(data) && data.every(d => typeof d === 'string')) {
 						params['body'] = me._getBodyForInsert();
 					}
 				} else {
@@ -559,8 +565,16 @@ class QueryCursor {
 		if (me.opts.sessionId !== undefined && typeof me.opts.sessionId === 'string') {
 			url.searchParams.append('session_id', me.opts.sessionId);
 		}
-		
-		url.searchParams.append('query', query);
+
+		if (me.connection.usePost) {
+			// use formData transfer query body for long sql
+			if (typeof params['formData'] === 'undefined') {
+				params['formData'] = {}
+			}
+			params['formData']['query'] = query;
+		} else {
+			url.searchParams.append('query', query);
+		}
 		
 		if (me.connection.isUseGzip) {
 			params.headers['Accept-Encoding']  = 'gzip';
@@ -722,6 +736,11 @@ class QueryCursor {
 			
 			const requestStream = request.post(reqParams);
 			
+			// handle network socket errors to avoid uncaught error
+			requestStream.on('error', function (err) {
+				rs.emit('error', err);
+			});
+
 			// Не делаем .pipe(rs) потому что rs - Readable,
 			// а для pipe нужен Writable
 			let s;
@@ -824,6 +843,8 @@ class ClickHouse {
 				format: FORMAT_NAMES.JSON,
 				raw: false,
 				isSessionPerQuery: false,
+				trimQuery: false,
+				usePost: false,
 			},
 			opts
 		);
@@ -939,6 +960,24 @@ class ClickHouse {
 		} else {
 			return JSON.parse;
 		}
+	}
+
+	get trimQuery() {
+		return this.opts.trimQuery;
+	}
+
+	set trimQuery(val) {
+		this.opts.trimQuery = !!val;
+		return this;
+	}
+
+	get usePost() {
+		return this.opts.usePost;
+	}
+
+	set usePost(val) {
+		this.opts.usePost = !!val;
+		return this;
 	}
 	
 	static mapRowAsArray(row) {
